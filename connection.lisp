@@ -33,7 +33,10 @@ for debugging purposes.  The default is *STANDARD-OUTPUT*.")
     :reader   connection-encoding)
    (stream
     :initform nil
-    :accessor connection-stream))
+    :accessor connection-stream)
+   (socket
+    :initform nil
+    :accessor connection-socket))
   (:documentation "Representation of a Redis connection."))
 
 (defmethod connection-external-format ((connection redis-connection))
@@ -78,14 +81,15 @@ offering a :reconnect restart whose body is given by BODY."
   "Create a socket connection to the host and port of CONNECTION and
 set the stream of CONNECTION to the associated stream."
   (provide-reconnect-restart
-      (setf (connection-stream connection)
-            (make-flexi-stream
-             (socket-stream
-              (socket-connect (connection-host connection)
-                              (connection-port connection)
-                              :element-type 'octet))
-             :external-format (connection-external-format connection)
-             :element-type 'octet))
+      (setf (connection-socket connection)
+            (socket-connect (connection-host connection)
+                            (connection-port connection)
+                            :element-type 'octet)
+            (connection-stream connection)
+            (make-flexi-stream (socket-stream (connection-socket connection))
+                               :external-format (connection-external-format
+                                                 connection)
+                               :element-type 'octet))
     (open-connection connection)))
 
 (defun open-connection-p (connection)
@@ -95,8 +99,12 @@ set the stream of CONNECTION to the associated stream."
 
 (defun close-connection (connection)
   "Close the stream of CONNECTION."
-  (when (open-connection-p connection)
-    (ignore-errors (close (connection-stream connection)))))
+  (socket-close (connection-socket connection)))
+
+(defun reopen-connection (connection)
+  "Close and reopen CONNECTION."
+  (close-connection connection)
+  (open-connection connection))
 
 (defun ensure-connection (connection)
   "Ensure that CONNECTION is open before doing anything with it."
@@ -105,7 +113,7 @@ set the stream of CONNECTION to the associated stream."
   (unless (open-connection-p connection)
     (signal-connection-error-with-reconnect-restart
      :message "Connection to Redis server lost."
-     :restart (open-connection connection))))
+     :restart (reopen-connection connection))))
 
 (defmacro with-reconnect-restart (connection &body body)
   "When, inside BODY, an error occurs that breaks the stream of CONNECTION,
@@ -116,7 +124,7 @@ restart."
        (ensure-connection ,=connection=)
        (labels ((,=body= ()
                   (provide-reconnect-restart (progn ,@body)
-                    (open-connection ,=connection=)
+                    (reopen-connection ,=connection=)
                     (,=body=))))
          (,=body=)))))
 
@@ -131,18 +139,18 @@ specified by the given HOST, PORT, and ENCODING."
                                       :port ,port
                                       :encoding ,encoding)))
      (unwind-protect (progn ,@body)
-       (close-connection *connection*))))
+       (ignore-errors (close-connection *connection*)))))
 
-(defmacro with-recursive-connection (&body body)
+(defmacro with-recursive-connection ((&key (host #(127 0 0 1))
+                                           (port 6379)
+                                           (encoding :utf-8))
+                                     &body body)
   "Execute BODY with *CONNECTION* bound to the default Redis
 connection. If connection is already established, reuse it."
-  `(if *connection*
-       (progn
-         (open-connection *connection*)
-         ,@body)
-       (with-connection () ,@body)))
+  `(if (connected-p) (progn ,@body)
+       (with-connection (:host ,host :port ,port :encoding ,encoding)
+         ,@body)))
        
-
 (defun connected-p ()
   "Is the current connection to Redis server still open?"
   (and *connection* (open-connection-p *connection*)))
@@ -164,8 +172,11 @@ connection. If connection is already established, reuse it."
 
 (defun disconnect ()
   "Disconnect from Redis server."
-  (when (connected-p)
-    (close-connection *connection*))
+  (close-connection *connection*)
   (setf *connection* nil))
+
+(defun reconnect ()
+  "Close and reopen the connection to Redis server."
+  (reopen-connection *connection*))
 
 ;;; end
